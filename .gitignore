@@ -4,7 +4,8 @@ raw_main_dataset/
 
 
 
-
+# Environment Files
+.env
 
 # Conda file
 .conda/
