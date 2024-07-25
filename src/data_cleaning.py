@@ -1,13 +1,32 @@
 from functools import reduce
+from typing import List
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import pyspark.sql.functions as F
 from loguru import logger
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import (avg, coalesce, col, collect_set, concat_ws,
-                                   countDistinct, max, min, row_number, sum)
-from pyspark.sql.types import DateType, FloatType, IntegerType, StringType
+from pyspark.sql.functions import (
+    avg,
+    coalesce,
+    col,
+    collect_set,
+    concat_ws,
+    countDistinct,
+)
+from pyspark.sql.functions import max as pyspark_max
+from pyspark.sql.functions import min, row_number, sum
+from pyspark.sql.types import (
+    ByteType,
+    DateType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+)
 from pyspark.sql.window import Window
 from tqdm import tqdm
 
@@ -48,6 +67,59 @@ def set_table_dtypes(df: DataFrame) -> DataFrame:
 
     for column, dtype in transformations:
         df = df.withColumn(column, col(column).cast(dtype))
+
+    return df
+
+
+# Function to calculate memory usage in MB
+def calculate_memory_usage(df):
+    return df.rdd.map(lambda row: row.__sizeof__()).sum() / 1024**2
+
+
+def reduce_mem_usage(df: DataFrame) -> DataFrame:
+    """
+    Iterate through all the columns of a dataframe and modify the data type to reduce memory usage
+    """
+
+    start_mem = calculate_memory_usage(df)
+    print(f"Memory usage of dataframe is {start_mem:.2f} MB")
+
+    for col_name, col_type in df.dtypes:
+        if (
+            col_type == "int"
+            or col_type == "bigint"
+            or col_type == "tinyint"
+            or col_type == "smallint"
+        ):
+            min_val, max_val = df.select(
+                F.coalesce(F.min(col_name), F.lit(0)),
+                F.coalesce(F.max(col_name), F.lit(0)),
+            ).first()
+            if min_val is not None and max_val is not None:
+                if min_val > -128 and max_val < 127:
+                    df = df.withColumn(col_name, df[col_name].cast(ByteType()))
+                elif min_val > -32768 and max_val < 32767:
+                    df = df.withColumn(col_name, df[col_name].cast(ShortType()))
+                elif min_val > -2147483648 and max_val < 2147483647:
+                    df = df.withColumn(col_name, df[col_name].cast(IntegerType()))
+                else:
+                    df = df.withColumn(col_name, df[col_name].cast(LongType()))
+        elif col_type == "double" or col_type == "float":
+            min_val, max_val = df.select(
+                F.coalesce(F.min(col_name), F.lit(0.0)),
+                F.coalesce(F.max(col_name), F.lit(0.0)),
+            ).first()
+            if min_val is not None and max_val is not None:
+                if min_val > -3.4e38 and max_val < 3.4e38:
+                    df = df.withColumn(col_name, df[col_name].cast(FloatType()))
+                else:
+                    df = df.withColumn(col_name, df[col_name].cast(DoubleType()))
+        elif col_type == "string":
+            df = df.withColumn(col_name, df[col_name].cast(StringType()))
+
+    end_mem = calculate_memory_usage(df)
+    print(f"Memory usage after optimization is: {end_mem:.2f} MB")
+    print(f"Decreased by {100 * (start_mem - end_mem) / start_mem:.1f}%")
 
     return df
 
@@ -166,7 +238,7 @@ def create_pie_chart(df, column_name):
     """
     Create a Pie Chart of a single column using Plotly
 
-    Parameters: 
+    Parameters:
     - df: DataFrame containing the data
     - column_name: Name of the column to create the Pie Chart for
 
@@ -194,32 +266,6 @@ def create_pie_chart(df, column_name):
     fig.update_traces(textposition="outside", textinfo="percent+label")
     fig.update_layout(showlegend=True, width=500)
     fig.show()
-
-
-def get_shape_df(df):
-    """
-    To get the shape of Pyspark dataframe.
-
-    Parameters:
-    df (DataFrame): The input Pyspark DataFrame.
-
-    Returns:
-    None
-    """
-
-    # Get the number of rows
-    num_rows = df.count()
-
-    # Get the number of columns
-    num_columns = len(df.columns)
-
-    # Print the shape of the DataFrame
-    print(f"Number of rows: {num_rows}")
-    print(f"Number of columns: {num_columns}")
-
-    # Alternatively, you can return the shape as a tuple
-    shape = (num_rows, num_columns)
-    print(f"Shape of DataFrame: {shape}")
 
 
 def get_columns_high_missing_values(df, threshold=None, display=True):
@@ -292,6 +338,50 @@ def clean_base_dataset(df):
     return df
 
 
+def get_max_per_group(
+    df: DataFrame,
+    group_by_column: str,
+    join_indicator: bool = False,
+    columns_to_skip: List[str] = None,
+):
+    """
+    Get the maximum value of all columns in the DataFrame, grouped by a specified column.
+
+    Args:
+        df (DataFrame): The input PySpark DataFrame.
+        group_by_column (str): The column to group by.
+
+    Returns:
+        DataFrame: A DataFrame with the maximum values for each group.
+    """
+    default_columns_to_skip = [group_by_column, "num_group1", "num_group2", "num_group"]
+    if columns_to_skip:
+        columns_to_skip = columns_to_skip + default_columns_to_skip
+    else:
+        columns_to_skip = default_columns_to_skip
+
+    # Select numeric columns for the max operation
+    numeric_cols = [
+        field.name
+        for field in df.schema.fields
+        if isinstance(field.dataType, (IntegerType, DoubleType, FloatType, LongType))
+        and field.name not in columns_to_skip
+    ]
+
+    # Apply the max function to all numeric columns
+    max_exprs = [pyspark_max(col).alias(f"Max_{col}") for col in numeric_cols]
+    grouped_max_train_applprev_df = df.groupBy(group_by_column).agg(*max_exprs)
+
+    grouped_max_train_applprev_df = grouped_max_train_applprev_df.withColumnRenamed(
+        "Max_case_id", "case_id"
+    )
+
+    if join_indicator:
+        return df.join(grouped_max_train_applprev_df, on="case_id", how="left")
+
+    return grouped_max_train_applprev_df
+
+
 def clean_previous_applications_dataset(df):
     df.sort("case_id", "num_group1")
 
@@ -302,6 +392,8 @@ def clean_previous_applications_dataset(df):
     )
     df = df.drop(*list(missing_values_dict.keys()))
 
+    df = get_max_per_group(df=df, group_by_column="case_id", join_indicator=True)
+
     window_spec = Window.partitionBy("case_id").orderBy(col("creationdate_885D").desc())
     df = df.withColumn("row_number", row_number().over(window_spec))
     df = df.filter(col("row_number") == 1).drop("row_number")
@@ -311,60 +403,28 @@ def clean_previous_applications_dataset(df):
     return df
 
 
+def process_group_credit_bureau_dataset(df, num_group, threshold):
+    df_group = df.filter(df.num_group1 == num_group)
+    missing_values_dict = get_columns_high_missing_values(
+        df_group, threshold=threshold, display=False
+    )
+    df_group = df_group.drop(*list(missing_values_dict.keys()))
+    logger.debug(
+        f"Group {num_group}: Total Number of Rows: {df_group.count()}, "
+        f"Total Number of Unique Case ID: {df_group.select(countDistinct('case_id')).collect()[0][0]}"
+    )
+    new_columns = [
+        f"{column_name} as {column_name}_num_group_{num_group}"
+        for column_name in df_group.columns
+    ]
+    return df_group.selectExpr(*new_columns)
+
+
 def clean_credit_bureau_dataset(df):
     df = set_table_dtypes(df)
 
-    df = df.filter((df.num_group1 == 0) | (df.num_group1 == 1))
-    df = df.sort("case_id", "num_group1")
-
-    df_credit_bureau_num_group_0 = df.filter((df.num_group1 == 0))
-    missing_values_dict = get_columns_high_missing_values(
-        df_credit_bureau_num_group_0, threshold=15, display=False
-    )
-
-    df_credit_bureau_num_group_0 = df_credit_bureau_num_group_0.drop(
-        *list(missing_values_dict.keys())
-    )
-
-    print(
-        "Total Number of Row: ",
-        df_credit_bureau_num_group_0.count(),
-        "\nTotal Number of Unique Case ID: ",
-        df_credit_bureau_num_group_0.select(countDistinct("case_id")).collect()[0][0],
-    )
-
-    df_credit_bureau_num_group_1 = df.filter((df.num_group1 == 1))
-
-    missing_values_dict = get_columns_high_missing_values(
-        df_credit_bureau_num_group_1, threshold=10, display=False
-    )
-
-    df_credit_bureau_num_group_1 = df_credit_bureau_num_group_1.drop(
-        *list(missing_values_dict.keys())
-    )
-
-    print(
-        "Total Number of Row: ",
-        df_credit_bureau_num_group_1.count(),
-        "\nTotal Number of Unique Case ID: ",
-        df_credit_bureau_num_group_1.select(countDistinct("case_id")).collect()[0][0],
-    )
-
-    # Rename Column using selectExpr to rename columns
-    new_columns = [
-        f"{column_name} as {column_name}_num_group_0"
-        for column_name in df_credit_bureau_num_group_0.columns
-    ]
-    print("Number of columns: ", len(new_columns))
-
-    df_credit_bureau_num_group_0 = df_credit_bureau_num_group_0.selectExpr(*new_columns)
-
-    new_columns = [
-        f"{column_name} as {column_name}_num_group_1"
-        for column_name in df_credit_bureau_num_group_1.columns
-    ]
-    df_credit_bureau_num_group_1 = df_credit_bureau_num_group_1.selectExpr(*new_columns)
-    print("Number of columns: ", len(new_columns))
+    df_credit_bureau_num_group_0 = process_group_credit_bureau_dataset(df, 0, 5)
+    df_credit_bureau_num_group_1 = process_group_credit_bureau_dataset(df, 1, 5)
 
     df_credit_bureau = df_credit_bureau_num_group_0.join(
         df_credit_bureau_num_group_1,
@@ -382,6 +442,8 @@ def clean_credit_bureau_dataset(df):
 
 def clean_person_dataset(df):
     df = set_table_dtypes(df)
+
+    df = get_max_per_group(df=df, group_by_column="case_id", join_indicator=True)
 
     df = df.filter(df.num_group1 == 0)
 
@@ -403,7 +465,6 @@ def clean_static_dataset(df):
     )
 
     df = df.drop(*list(missing_values_dict.keys()))
-
     return df
 
 
@@ -416,7 +477,6 @@ def clean_static_cb_dataset(df):
     )
 
     df = df.drop(*list(missing_values_dict.keys()))
-
     return df
 
 
@@ -428,36 +488,40 @@ def clean_tax_registry_dataset(df):
         # collect_set("case_id").alias("case_id"),
         avg("amount").alias("average_tax_registry_amount"),
         sum("amount").alias("total_tax_registry_amount"),
+        pyspark_max("amount").alias("max_amount"),
         min("tax_registry_date").alias("min_tax_registry_date"),
-        max("tax_registry_date").alias("max_tax_registry_date"),
+        pyspark_max("tax_registry_date").alias("max_tax_registry_date"),
         concat_ws(", ", collect_set("tax_registry_provider")).alias(
             "tax_registry_provider"
         ),
     )
-
     return df
 
 
-def row_missing_value_analysis(df, display_histogram=True, title_text=''):
+def row_missing_value_analysis(df, display_histogram=True, title_text=""):
     null_columns = [col(column).isNull().cast("int") for column in df.columns]
 
     # Sum the null value indicators across the columns for each row using reduce
     missing_count_col = reduce(lambda a, b: a + b, null_columns)
 
     # Add the missing_count column to the DataFrame
-    df_missing_count = df.withColumn("missing_count", missing_count_col).select("case_id", "WEEK_NUM", "missing_count")
-
+    df_missing_count = df.withColumn("missing_count", missing_count_col).select(
+        "case_id", "WEEK_NUM", "missing_count"
+    )
 
     if display_histogram:
         # Collect the data from the DataFrame
         missing_count_data = df_missing_count.select("missing_count").collect()
 
         # Convert to a list of values
-        missing_count_values = [row['missing_count'] for row in missing_count_data]
+        missing_count_values = [row["missing_count"] for row in missing_count_data]
 
         # Create a histogram using Plotly
-        fig = px.histogram(missing_count_values, title="Histogram of Missing Values Count - " + title_text,
-                        labels={'value': 'Missing Count', 'count': 'Frequency'})
+        fig = px.histogram(
+            missing_count_values,
+            title="Histogram of Missing Values Count - " + title_text,
+            labels={"value": "Missing Count", "count": "Frequency"},
+        )
 
         # Show the plot
         fig.show()

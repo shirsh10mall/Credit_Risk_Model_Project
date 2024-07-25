@@ -19,6 +19,10 @@ loguru = "^0.7.2"
 ruff = "^0.5.4"
 isort = "^5.13.2"
 python-dotenv = "^1.0.1"
+catboost = "^1.2.5"
+xgboost = "^2.1.0"
+scikit-learn = "^1.5.1"
+pyarrow = "^17.0.0"
 
 [build-system]
 requires = ["poetry-core"]

@@ -1,8 +1,10 @@
+import pickle
 from pathlib import Path
 from typing import List, Union
 
 from loguru import logger
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
+from tqdm import tqdm
 
 
 def clear_gc():
@@ -10,7 +12,9 @@ def clear_gc():
     Clears the garbage collected by the Python interpreter to release memory resources.
     """
     import gc
+
     return gc.collect()
+
 
 def import_parquet_file(
     file_path: Union[str, Path], app_name: str = "Import_Parquet_File"
@@ -31,9 +35,12 @@ def import_parquet_file(
 
     try:
         logger.info(f"Starting Spark session with app name: {app_name}")
+        # spark = SparkSession.builder.appName(app_name).getOrCreate()
         spark = SparkSession.builder.appName(app_name).getOrCreate()
+
         logger.info(f"Reading Parquet file from path: {file_path}")
         df = spark.read.parquet(file_path)
+
         logger.info("Parquet file loaded successfully")
         return df, spark
     except Exception as e:
@@ -89,3 +96,66 @@ def import_and_concatenate_parquet_files(
 
     logger.info("Concatenation complete")
     return concatenated_df, spark
+
+
+def count_unique_values(df: DataFrame) -> dict:
+    """
+    Count the number of unique values in each column of a PySpark DataFrame.
+
+    :param df: PySpark DataFrame
+    :return: Dictionary with column names as keys and number of unique values as values
+    """
+    unique_counts = {}
+
+    for column in tqdm(df.columns):
+        # Get the number of distinct values in each column
+        unique_count = df.select(column).distinct().count()
+        unique_counts[column] = unique_count
+
+    return unique_counts
+
+
+def load_pickle(file_path):
+    """
+    Load data from a pickle file.
+
+    Args:
+        file_path (str): The path to the pickle file.
+
+    Returns:
+        object: The object stored in the pickle file.
+    """
+    try:
+        with open(file_path, "rb") as file:
+            data = pickle.load(file)
+            logger.info(f"Successfully loaded data from {file_path}")
+            return data
+    except (FileNotFoundError, pickle.PickleError) as e:
+        logger.error(f"Error loading pickle file: {e}")
+        raise
+
+
+def get_shape_df(df):
+    """
+    To get the shape of Pyspark dataframe.
+
+    Parameters:
+    df (DataFrame): The input Pyspark DataFrame.
+
+    Returns:
+    None
+    """
+
+    # Get the number of rows
+    num_rows = df.count()
+
+    # Get the number of columns
+    num_columns = len(df.columns)
+
+    # Print the shape of the DataFrame
+    print(f"Number of rows: {num_rows}")
+    print(f"Number of columns: {num_columns}")
+
+    # Alternatively, you can return the shape as a tuple
+    shape = (num_rows, num_columns)
+    print(f"Shape of DataFrame: {shape}")
